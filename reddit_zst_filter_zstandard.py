@@ -290,9 +290,14 @@ def main():
         for input_file in input_files
     ]
 
+    output_of = {task[0]: task[4] for task in tasks}  # input file -> its output path
+    created_files = []
+
     def account(result):
         nonlocal total_processed, total_lines, total_matched, total_errors
         file_path, lines_processed, matched_count, error_count = result
+        if matched_count > 0 and os.path.exists(output_of[file_path]):
+            created_files.append(output_of[file_path])
         total_processed += 1
         total_lines += lines_processed
         total_matched += matched_count
@@ -342,18 +347,10 @@ def main():
         log.info(f"Processing rate: {total_lines / elapsed:.0f} lines/second")
     log.info(f"Output directory: {args.output_dir}")
 
-    if args.format == 'csv':
-        csv_compression = config.get('output', 'csv_compression')
-        ext = '.csv.gz' if csv_compression == 'gzip' else '.csv'
-    else:
-        ext = '.parquet'
-    output_files = [f for f in os.listdir(args.output_dir) if f.endswith(ext)]
-    log.info(f"Output files created: {len(output_files)}")
-
-    total_size = sum(
-        os.path.getsize(os.path.join(args.output_dir, f))
-        for f in output_files
-    ) if output_files else 0
+    # Only files written by this run: the output dir may already hold files
+    # from earlier runs (other months, submissions vs comments, ...).
+    log.info(f"Output files created: {len(created_files)}")
+    total_size = sum(os.path.getsize(f) for f in created_files)
     log.info(f"Total output size: {total_size / (1024 ** 2):.2f} MB")
 
 

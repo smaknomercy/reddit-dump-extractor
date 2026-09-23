@@ -175,6 +175,18 @@ def main():
             if w == 2 and ok:
                 check("--workers 2: per-file progress logged from workers",
                       "RC_a.zst" in r.stderr and "RC_b.zst" in r.stderr)
+        # summary counts only this run's files, not what was already in the output dir
+        out_dir = os.path.join(tmp, "workers1")
+        with open(os.path.join(out_dir, "RS_old_run.csv"), "w") as f:
+            f.write("id\nold\n")
+        r = subprocess.run(
+            [sys.executable, os.path.join(repo, "reddit_zst_filter_zstandard.py"), dumps,
+             "--value", ",".join(VALUES), "--fields", ",".join(fields),
+             "--output_dir", out_dir, "--config", os.path.join(tmp, "config.json")],
+            cwd=tmp, capture_output=True, text=True)
+        check("summary: 'Output files created' counts only this run",
+              "Output files created: 2" in r.stderr,
+              [ln for ln in r.stderr.splitlines() if "Output files created" in ln])
         same = outputs.get(1) and outputs.get(2) and outputs[1].keys() == outputs[2].keys() and all(
             outputs[1][n].equals(outputs[2][n]) for n in outputs[1])
         check("--workers 2 output == --workers 1 output", bool(same))
