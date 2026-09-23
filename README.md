@@ -156,6 +156,44 @@ python reddit_zst_filter_zstandard.py <input_folder> [options]
 | `--regex` | Enable regex patterns | `false` |
 | `--file_filter` | Regex for filenames | `^RC_\|^RS_` |
 | `--config` | Path to config.json | `config.json` |
+| `--fields` | Keep only these fields: comma list or preset from `config.json` (`submissions`, `comments`). With CSV, output is written in batches | all fields |
+| `--batch_size` | Records per write when `--fields` is set | `100000` |
+| `--no_prefilter` | Parse JSON of every line (original behaviour) | `false` |
+
+### Faster filtering and flat memory
+
+**Byte-level prefilter (on by default for exact matching).** Before parsing JSON,
+each raw block is searched with one compiled regex for
+`"<field>" : "<value1|value2|...>"` (case-insensitive). Only matching lines are
+parsed; the exact check on the parsed object is unchanged, so the matched
+records are identical. Lines that match only by accident (e.g. the value inside
+`crosspost_parent_list`) are still rejected by the exact check.
+The prefilter is switched off automatically in `--regex` mode and for values
+that are not plain ASCII names. Note: malformed lines are then counted only
+among candidates; use `--no_prefilter` to count them in the whole file.
+
+**Streaming output.** `--fields` keeps only the listed columns and, for CSV,
+appends to the output every `--batch_size` records instead of holding all
+matches in memory. Useful for comment dumps from large subreddits.
+
+```bash
+python reddit_zst_filter_zstandard.py /path/to/dumps \
+  --file_filter "^RC_" --value "ukraine,europe" --fields comments
+```
+
+Progress is logged with percent of the compressed file and ETA.
+
+**Benchmark** (2,000,000 lines of `RC_2026-07`, 8 subreddits, 2,079 matches;
+Linux VM, 4 cores, same machine for both runs):
+
+| | wall time | lines/s | peak RAM |
+|---|---|---|---|
+| original | 32.8 s | 62k | 1.68 GB |
+| prefilter, all fields | 9.1 s | 233k | 0.60 GB |
+| prefilter + `--fields comments` | 9.3 s | 228k | 0.60 GB |
+
+Outputs of the original and the prefiltered run are cell-by-cell identical.
+Equivalence on edge cases: `python tests/test_equivalence.py`.
 
 ### Examples
 
@@ -236,7 +274,7 @@ Both methods log:
 - Records matched per file
 - Final statistics (total lines, matches, errors, processing rate)
 
-Logs are saved to `logs/reddit_filter.log` with file rotation.
+Logs are saved to `logs/bot.log` (see `logging.log_file_name` in `config.json`) with file rotation.
 
 ---
 
@@ -335,10 +373,11 @@ See `requirements.txt` for full list.
 ```
 .
 ├── reddit_filter_utils.py          # Shared utilities
-├── reddit_zst_filter_shell.py      # Method 1 (Shell Pipes)
-├── reddit_zst_filter_python.py     # Method 2 (Python)
+├── reddit_zst_filter_zstd_jq.py    # Method 1 (Shell Pipes)
+├── reddit_zst_filter_zstandard.py  # Method 2 (Python)
 ├── config.json                     # Configuration
 ├── requirements.txt                # Python dependencies
+├── tests/test_equivalence.py       # Prefilter / streaming equivalence tests
 └── logs/                           # Processing logs
 ```
 
