@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import json
+import logging
+import logging.handlers
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -33,11 +36,13 @@ class OutputWriter:
         self.output_format = output_format
         self.config = config
         self.fields = fields
-        self.stream = fields is not None and output_format == 'csv'
+        # with a fixed column list both formats can be written in batches
+        self.stream = fields is not None
         self.batch_size = batch_size
         self.buffer = []
         self.written = 0
         self.count = 0
+        self.parquet_writer = None
 
     def add(self, obj: dict):
         if self.fields is not None:
@@ -55,20 +60,47 @@ class OutputWriter:
         if not self.buffer:
             return
         df = self._frame()
-        df.to_csv(
-            self.output_path,
-            mode='w' if self.written == 0 else 'a',
-            header=self.written == 0,
-            compression=self.config.get('output', 'csv_compression'),
-            index=False
-        )
+        if self.output_format == 'parquet':
+            self._write_parquet_batch(df)
+        else:
+            df.to_csv(
+                self.output_path,
+                mode='w' if self.written == 0 else 'a',
+                header=self.written == 0,
+                compression=self.config.get('output', 'csv_compression'),
+                index=False
+            )
         self.written += len(self.buffer)
         self.buffer = []
+
+    def _write_parquet_batch(self, df: pd.DataFrame):
+        """
+        Append one row group. Parquet needs the same schema for every batch,
+        but pandas infers types per batch (a column can be int in one batch and
+        all-empty in the next). So in streaming mode every column is stored as
+        a string, with missing values as nulls; the values are the same text
+        the CSV output would contain. Cast types after loading if needed.
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        if self.parquet_writer is None:
+            schema = pa.schema([(c, pa.string()) for c in self.fields])
+            self.parquet_writer = pq.ParquetWriter(
+                self.output_path, schema,
+                compression=self.config.get('output', 'parquet_compression'))
+        arrays = []
+        for c in self.fields:
+            col = df[c].astype(object)
+            col = col.where(col.notna(), None)
+            arrays.append(pa.array([None if v is None else str(v) for v in col], type=pa.string()))
+        self.parquet_writer.write_table(pa.Table.from_arrays(arrays, schema=self.parquet_writer.schema))
 
     def close(self):
         """Write whatever is left. Returns True if an output file exists."""
         if self.stream:
             self._flush()
+            if self.parquet_writer is not None:
+                self.parquet_writer.close()
             return self.written > 0
         if not self.buffer:
             return False
@@ -111,6 +143,8 @@ def process_file_python(
     are parsed; the exact check below is unchanged, so the matched records
     are the same. Malformed lines are then counted only among candidates.
     """
+    if log is None:  # inside a worker process
+        log = logging.getLogger("reddit_filter")
     writer = OutputWriter(output_path, output_format, config, fields, batch_size)
     lines_processed = 0
     error_lines = 0
@@ -185,6 +219,19 @@ def process_file_python(
     return file_path, lines_processed, writer.count, error_lines
 
 
+def _init_worker(log_queue):
+    """Worker processes send log records to the main process through a queue."""
+    log = logging.getLogger("reddit_filter")
+    log.handlers.clear()
+    log.setLevel(logging.INFO)
+    log.addHandler(logging.handlers.QueueHandler(log_queue))
+
+
+def _run_task(task):
+    """Unpack one file's arguments; runs in a worker process."""
+    return process_file_python(*task)
+
+
 def main():
     args = parse_arguments()
     config = Config(args.config)
@@ -202,8 +249,9 @@ def main():
     log.info(f"Output format: {args.format}")
     log.info(f"Field: {args.field} | Value: {args.value} | Regex: {args.regex}")
     if fields:
-        mode = f"streaming, batch {batch_size:,}" if args.format == 'csv' else "in memory"
-        log.info(f"Fields ({len(fields)}, {mode}): {', '.join(fields)}")
+        log.info(f"Fields ({len(fields)}, streaming, batch {batch_size:,}): {', '.join(fields)}")
+    if args.workers > 1:
+        log.info(f"Workers: {args.workers} files in parallel")
     log.info("=" * 80)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -235,36 +283,44 @@ def main():
     log.info("Starting processing...")
     log.info("=" * 80)
 
+    tasks = [
+        (input_file, args.field, values, args.regex,
+         generate_output_path(input_file, args.output_dir, args.format, config),
+         args.format, config, None, file_reader, prefilter, fields, batch_size)
+        for input_file in input_files
+    ]
+
+    def account(result):
+        nonlocal total_processed, total_lines, total_matched, total_errors
+        file_path, lines_processed, matched_count, error_count = result
+        total_processed += 1
+        total_lines += lines_processed
+        total_matched += matched_count
+        total_errors += error_count
+        progress_pct = (total_processed / len(input_files)) * 100
+        mem_stats = memory_monitor.get_usage_stats()
+        log.info(
+            f"Progress: {total_processed}/{len(input_files)} ({progress_pct:.1f}%) | "
+            f"Total matched: {total_matched:,} | RAM (main process): {mem_stats['rss_gb']:.2f} GB"
+        )
+
+    workers = max(1, min(args.workers, len(tasks)))
     try:
-        for input_file in input_files:
-            output_path = generate_output_path(
-                input_file, args.output_dir, args.format, config)
-            file_path, lines_processed, matched_count, error_count = process_file_python(
-                input_file,
-                args.field,
-                values,
-                args.regex,
-                output_path,
-                args.format,
-                config,
-                log,
-                file_reader,
-                prefilter=prefilter,
-                fields=fields,
-                batch_size=batch_size,
-            )
-
-            total_processed += 1
-            total_lines += lines_processed
-            total_matched += matched_count
-            total_errors += error_count
-
-            progress_pct = (total_processed / len(input_files)) * 100
-            mem_stats = memory_monitor.get_usage_stats()
-            log.info(
-                f"Progress: {total_processed}/{len(input_files)} ({progress_pct:.1f}%) | "
-                f"Total matched: {total_matched:,} | RAM: {mem_stats['rss_gb']:.2f} GB"
-            )
+        if workers == 1:
+            for task in tasks:
+                account(process_file_python(*task[:7], log, *task[8:]))
+        else:
+            # "spawn" behaves the same on macOS, Linux and Windows
+            ctx = mp.get_context("spawn")
+            log_queue = ctx.Queue()
+            listener = logging.handlers.QueueListener(log_queue, *log.handlers)
+            listener.start()
+            try:
+                with ctx.Pool(workers, initializer=_init_worker, initargs=(log_queue,)) as pool:
+                    for result in pool.imap_unordered(_run_task, tasks):
+                        account(result)
+            finally:
+                listener.stop()
 
     except KeyboardInterrupt:
         log.warning("Processing interrupted by user")

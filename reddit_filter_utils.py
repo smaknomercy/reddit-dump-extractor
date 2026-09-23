@@ -313,6 +313,14 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--workers",
+        type=int,
+        help="Process this many .zst files in parallel (one process per file; default: 1). "
+             "RAM grows with the number of workers, so combine with --fields on big files.",
+        default=1
+    )
+
+    parser.add_argument(
         "--no_prefilter",
         help="Parse JSON of every line (original behaviour; slower). "
              "Use to compare results or to count malformed lines in the whole file.",
