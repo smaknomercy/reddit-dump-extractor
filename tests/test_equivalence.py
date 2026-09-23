@@ -96,7 +96,10 @@ def main():
 
     def check(name, cond, detail=""):
         nonlocal failures
-        print(("PASS " if cond else "FAIL ") + name + (f"  {detail}" if detail and not cond else ""))
+        tag = "PASS" if cond else "FAIL"
+        if sys.stdout.isatty():
+            tag = f"\033[{'32' if cond else '31'}m{tag}\033[0m"
+        print(f"{tag} {name}" + (f"  {detail}" if detail and not cond else ""))
         failures += 0 if cond else 1
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -178,7 +181,10 @@ def main():
         all_ids = set().union(*[set(df["id"]) for df in outputs.get(2, {}).values()]) if outputs.get(2) else set()
         check("--workers 2: union of files == reference ids", all_ids == ref_ids, f"{sorted(all_ids ^ ref_ids)}")
 
-    print(f"\n{'OK' if failures == 0 else f'{failures} FAILED'} ({len(LINES)} synthetic lines, "
+    summary = "OK" if failures == 0 else f"{failures} FAILED"
+    if sys.stdout.isatty():
+        summary = f"\033[1;{'32' if failures == 0 else '31'}m{summary}\033[0m"
+    print(f"\n{summary} ({len(LINES)} synthetic lines, "
           f"{len(ref_ids)} expected matches)")
     sys.exit(1 if failures else 0)
 

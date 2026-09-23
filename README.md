@@ -193,21 +193,16 @@ python reddit_zst_filter_zstandard.py /path/to/dumps \
 
 Progress is logged with percent of the compressed file and ETA.
 
-**Benchmark** (2,000,000 lines of `RC_2026-07`, 8 subreddits, 2,079 matches;
-Linux VM, 4 cores, same machine for both runs):
+**Benchmark** (`benchmarks/compare_with_baseline.py`, first 5,000,000 lines of
+`RC_2026-07`, 8 subreddits, 9,154 matches; MacBook, 8 CPUs, Python 3.14):
 
-| | wall time | lines/s | peak RAM |
-|---|---|---|---|
-| original | 32.8 s | 62k | 1.68 GB |
-| prefilter, all fields | 9.1 s | 233k | 0.60 GB |
-| prefilter + `--fields comments` | 9.3 s | 228k | 0.60 GB |
+| | wall time | lines/s | peak RSS | output |
+|---|---|---|---|---|
+| original (`main`) | 43.8 s | 114k | 2.17 GB | reference |
+| prefilter, all fields | 20.3 s | 246k | 0.79 GB | byte-identical |
+| prefilter + `--fields comments` | 20.9 s | 239k | 0.73 GB | same records |
 
-Parallel files (4 files × 2,000,000 lines, `--fields comments`, same 4-core VM):
-
-| | wall time | lines/s |
-|---|---|---|
-| `--workers 1` | 39.8 s | 204k |
-| `--workers 4` | 19.7 s | 423k |
+`--workers 4` on 4 such files: 79.7 s → 37.7 s (2.1×).
 
 On a full month (MacBook, `RS_2026-07`, 45.7M lines): original 18.7 min,
 new version 7.2 min, peak RSS 1.14 GB; output byte-identical to the original.
@@ -216,6 +211,14 @@ Comments `RC_2026-07` + `RC_2026-08` (739M lines, two runs in parallel,
 
 Outputs of the original and the prefiltered run are cell-by-cell identical.
 Equivalence on edge cases: `python tests/test_equivalence.py`.
+
+Reproduce the comparison on your own dump (baseline = `main`, output checked
+byte-for-byte, peak memory measured per run):
+
+```bash
+python benchmarks/compare_with_baseline.py /path/to/RC_2023-01.zst \
+  --value "ukraine,europe" --lines 5000000 --workers 4
+```
 
 ### Examples
 
@@ -399,7 +402,8 @@ See `requirements.txt` for full list.
 ├── reddit_zst_filter_zstandard.py  # Method 2 (Python)
 ├── config.json                     # Configuration
 ├── requirements.txt                # Python dependencies
-├── tests/test_equivalence.py       # Prefilter / streaming equivalence tests
+├── tests/test_equivalence.py       # Prefilter / streaming / workers equivalence tests
+├── benchmarks/compare_with_baseline.py  # Speed & memory vs. a baseline git ref
 └── logs/                           # Processing logs
 ```
 
