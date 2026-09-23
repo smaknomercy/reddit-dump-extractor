@@ -4,7 +4,7 @@ import os
 import sys
 import time
 import re
-from typing import Union, List, Set, Tuple
+from typing import Union, List, Set, Tuple, Optional
 
 import pandas as pd
 import psutil
@@ -12,8 +12,82 @@ import psutil
 from reddit_filter_utils import (
     parse_arguments, Config, MemoryMonitor, load_filter_values,
     collect_input_files, generate_output_path, FileReader, json_loads,
-    DataNormalizer, setup_logging
+    DataNormalizer, setup_logging, build_prefilter, iter_candidate_lines,
+    resolve_fields, format_eta
 )
+
+
+class OutputWriter:
+    """
+    Collects matched records and writes them out.
+
+    Without `fields`: keeps every record in memory and writes once at the end
+    (original behaviour, all columns).
+    With `fields`: keeps only those columns and, for CSV, appends to the output
+    file every `batch_size` records, so memory stays flat on huge files.
+    """
+
+    def __init__(self, output_path: str, output_format: str, config: Config,
+                 fields: Optional[List[str]], batch_size: int):
+        self.output_path = output_path
+        self.output_format = output_format
+        self.config = config
+        self.fields = fields
+        self.stream = fields is not None and output_format == 'csv'
+        self.batch_size = batch_size
+        self.buffer = []
+        self.written = 0
+        self.count = 0
+
+    def add(self, obj: dict):
+        if self.fields is not None:
+            obj = {k: obj[k] for k in self.fields if k in obj}
+        self.buffer.append(obj)
+        self.count += 1
+        if self.stream and len(self.buffer) >= self.batch_size:
+            self._flush()
+
+    def _frame(self) -> pd.DataFrame:
+        df = pd.DataFrame(self.buffer, columns=self.fields) if self.fields else pd.DataFrame(self.buffer)
+        return DataNormalizer.normalize_dataframe(df, self.config)
+
+    def _flush(self):
+        if not self.buffer:
+            return
+        df = self._frame()
+        df.to_csv(
+            self.output_path,
+            mode='w' if self.written == 0 else 'a',
+            header=self.written == 0,
+            compression=self.config.get('output', 'csv_compression'),
+            index=False
+        )
+        self.written += len(self.buffer)
+        self.buffer = []
+
+    def close(self):
+        """Write whatever is left. Returns True if an output file exists."""
+        if self.stream:
+            self._flush()
+            return self.written > 0
+        if not self.buffer:
+            return False
+        df = self._frame()
+        if self.output_format == 'parquet':
+            df.to_parquet(
+                self.output_path,
+                engine='pyarrow',
+                compression=self.config.get('output', 'parquet_compression'),
+                index=False
+            )
+        else:
+            df.to_csv(
+                self.output_path,
+                compression=self.config.get('output', 'csv_compression'),
+                index=False
+            )
+        self.buffer = []
+        return True
 
 
 def process_file_python(
@@ -25,93 +99,100 @@ def process_file_python(
         output_format: str,
         config: Config,
         log,
-        file_reader: FileReader
+        file_reader: FileReader,
+        prefilter=None,
+        fields: Optional[List[str]] = None,
+        batch_size: int = 100000,
 ) -> Tuple[str, int, int, int]:
-    """Process file using Python's zstandard library"""
-    matched_records = []
+    """
+    Process one .zst file using Python's zstandard library.
+
+    With a prefilter, only lines whose raw bytes contain  "field":"value"
+    are parsed; the exact check below is unchanged, so the matched records
+    are the same. Malformed lines are then counted only among candidates.
+    """
+    writer = OutputWriter(output_path, output_format, config, fields, batch_size)
     lines_processed = 0
     error_lines = 0
+    name = os.path.basename(file_path)
 
     value = None
     if len(values) == 1 and not regex:
         value = min(values)
 
     process = psutil.Process()
+    process.cpu_percent()  # first call always returns 0.0; prime it
+    log_interval = config.get('processing', 'progress_log_interval')
+    next_log = log_interval
+    start = time.time()
+
+    def check(line: bytes):
+        nonlocal error_lines
+        try:
+            obj = json_loads(line)
+            observed = obj[field].lower()
+            if regex:
+                matched = any(reg.search(observed) for reg in values)
+            elif value is not None:
+                matched = observed == value
+            else:
+                matched = observed in values
+            if matched:
+                writer.add(obj)
+        except (KeyError, json.JSONDecodeError, AttributeError):
+            error_lines += 1
 
     try:
-        for line in file_reader.yield_lines(file_path):
-            try:
-                obj = json_loads(line)
-                matched = False
-                observed = obj[field].lower()
+        for block, pos, total in file_reader.iter_blocks(file_path):
+            if prefilter is not None:
+                for line in iter_candidate_lines(block, prefilter):
+                    check(line)
+            else:
+                for line in block.split(b'\n')[:-1]:
+                    check(line)
+            lines_processed += block.count(b'\n')
 
-                if regex:
-                    for reg in values:
-                        if reg.search(observed):
-                            matched = True
-                            break
-                else:
-                    if value is not None:
-                        matched = (observed == value)
-                    else:
-                        matched = (observed in values)
-
-                if matched:
-                    matched_records.append(obj)
-            except (KeyError, json.JSONDecodeError, AttributeError):
-                error_lines += 1
-
-            lines_processed += 1
-
-            if lines_processed % config.get('processing', 'progress_log_interval') == 0:
-                cpu = process.cpu_percent()
+            if lines_processed >= next_log:
+                next_log = (lines_processed // log_interval + 1) * log_interval
+                elapsed = time.time() - start
+                frac = pos / total if total else 0
+                eta = format_eta(elapsed * (1 - frac) / frac) if frac > 0 else "?"
                 mem = process.memory_info().rss / (1024 ** 3)
                 log.info(
-                    f"{os.path.basename(file_path)}: {lines_processed:,} lines, "
-                    f"{len(matched_records):,} matched, CPU: {cpu}%, RAM: {mem:.2f} GB")
+                    f"{name}: {frac:6.1%} | {lines_processed:,} lines, "
+                    f"{writer.count:,} matched | ETA {eta} | "
+                    f"CPU: {process.cpu_percent()}%, RAM: {mem:.2f} GB")
 
     except Exception as err:
         log.error(f"Error processing {file_path}: {err}")
         return file_path, lines_processed, 0, error_lines
 
-    if matched_records:
-        try:
-            df = pd.DataFrame(matched_records)
-            df = DataNormalizer.normalize_dataframe(df, config)
+    try:
+        created = writer.close()
+    except Exception as e:
+        log.error(f"Failed to write output file {output_path}: {e}")
+        return file_path, lines_processed, 0, error_lines
 
-            if output_format == 'parquet':
-                df.to_parquet(
-                    output_path,
-                    engine='pyarrow',
-                    compression=config.get('output', 'parquet_compression'),
-                    index=False
-                )
-            elif output_format == 'csv':
-                compression = config.get('output', 'csv_compression')
-                df.to_csv(
-                    output_path,
-                    compression=compression,
-                    index=False
-                )
-
-            log.info(
-                f"✓ Completed {os.path.basename(file_path)}: {lines_processed:,} lines, "
-                f"{len(matched_records):,} matched, {error_lines:,} errors -> {output_path}")
-        except Exception as e:
-            log.error(f"Failed to write output file {output_path}: {e}")
-            return file_path, lines_processed, 0, error_lines
+    if created:
+        log.info(
+            f"✓ Completed {name}: {lines_processed:,} lines, "
+            f"{writer.count:,} matched, {error_lines:,} errors -> {output_path}")
     else:
         log.info(
-            f"✓ Completed {os.path.basename(file_path)}: {lines_processed:,} lines, "
+            f"✓ Completed {name}: {lines_processed:,} lines, "
             f"0 matched, {error_lines:,} errors (no output file created)")
 
-    return file_path, lines_processed, len(matched_records), error_lines
+    return file_path, lines_processed, writer.count, error_lines
 
 
 def main():
     args = parse_arguments()
     config = Config(args.config)
     log = setup_logging(config)
+
+    fields = resolve_fields(args.fields, config)
+    # .get with defaults: older config.json files don't have the new keys
+    batch_size = args.batch_size or config._config.get('processing', {}).get('batch_size', 100000)
 
     log.info("=" * 80)
     log.info("Method 1 (Zstandard) - Reddit Dump Filter")
@@ -120,6 +201,9 @@ def main():
     log.info(f"Output directory: {args.output_dir}")
     log.info(f"Output format: {args.format}")
     log.info(f"Field: {args.field} | Value: {args.value} | Regex: {args.regex}")
+    if fields:
+        mode = f"streaming, batch {batch_size:,}" if args.format == 'csv' else "in memory"
+        log.info(f"Fields ({len(fields)}, {mode}): {', '.join(fields)}")
     log.info("=" * 80)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -127,6 +211,11 @@ def main():
     memory_monitor = MemoryMonitor()
     file_reader = FileReader(config)
     values = load_filter_values(args, log)
+    prefilter = None
+    if args.no_prefilter:
+        log.info("Prefilter disabled: --no_prefilter")
+    else:
+        prefilter = build_prefilter(args.field, values, args.regex, log)
 
     log.info(f"Scanning for input files matching pattern: {args.file_filter}")
     input_files = collect_input_files(args.input, args.file_filter, config)
@@ -159,7 +248,10 @@ def main():
                 args.format,
                 config,
                 log,
-                file_reader
+                file_reader,
+                prefilter=prefilter,
+                fields=fields,
+                batch_size=batch_size,
             )
 
             total_processed += 1
@@ -188,7 +280,7 @@ def main():
     log.info(f"Files processed: {total_processed}")
     log.info(f"Total lines scanned: {total_lines:,}")
     log.info(f"Total records matched: {total_matched:,}")
-    log.info(f"Total errors: {total_errors:,}")
+    log.info(f"Total errors: {total_errors:,}" + (" (among prefiltered candidates)" if prefilter else ""))
     log.info(f"Elapsed time: {elapsed:.1f} seconds")
     if total_lines > 0:
         log.info(f"Processing rate: {total_lines / elapsed:.0f} lines/second")
