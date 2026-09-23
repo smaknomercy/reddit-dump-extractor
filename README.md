@@ -194,15 +194,15 @@ python reddit_zst_filter_zstandard.py /path/to/dumps \
 Progress is logged with percent of the compressed file and ETA.
 
 **Benchmark** (`benchmarks/compare_with_baseline.py`, first 5,000,000 lines of
-`RC_2026-07`, 8 subreddits, 9,154 matches; MacBook, 8 CPUs, Python 3.14):
+`RC_2026-07`, 8 subreddits, 9,154 matches; MacBook, Apple M3, 8 CPUs, Python 3.14):
 
 | | wall time | lines/s | peak RSS | output |
 |---|---|---|---|---|
-| original (`main`) | 43.8 s | 114k | 2.17 GB | reference |
-| prefilter, all fields | 20.3 s | 246k | 0.79 GB | byte-identical |
-| prefilter + `--fields comments` | 20.9 s | 239k | 0.73 GB | same records |
+| original (`main`) | 44.8 s | 112k | 2.15 GB | reference |
+| prefilter, all fields | 20.4 s | 245k | 0.82 GB | byte-identical |
+| prefilter + `--fields comments` | 19.8 s | 252k | 0.74 GB | same records |
 
-`--workers 4` on 4 such files: 79.7 s → 37.7 s (2.1×).
+`--workers 4` on 4 such files: 79.3 s → 28.0 s (2.8×).
 
 On a full month (MacBook, `RS_2026-07`, 45.7M lines): original 18.7 min,
 new version 7.2 min, peak RSS 1.14 GB; output byte-identical to the original.
