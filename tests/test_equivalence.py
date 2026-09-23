@@ -11,6 +11,7 @@ Run from the repo root:  python tests/test_equivalence.py
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -127,6 +128,55 @@ def main():
         check("streaming: no duplicated header rows", "id" not in set(df_st["id"]))
         cyr = df_st.loc[df_st["id"] == "a6", "body"].iloc[0]
         check("streaming: multi-byte text intact", cyr.startswith("Поверніть Федорова 🇺🇦"), cyr)
+
+        # --- streaming Parquet (needs pyarrow)
+        try:
+            import pyarrow  # noqa: F401
+            have_pyarrow = True
+        except ImportError:
+            have_pyarrow = False
+            print("SKIP streaming parquet (pyarrow not installed)")
+        if have_pyarrow:
+            out_pq = os.path.join(tmp, "out_stream.parquet")
+            process_file_python(os.path.join(tmp, "RC_test.zst"), FIELD, VALUES, False, out_pq,
+                                "parquet", config, log, FileReader(config),
+                                prefilter=pf, fields=fields, batch_size=2)
+            pq_df = pd.read_parquet(out_pq)
+            check("streaming parquet (batch 2) == reference ids", set(pq_df["id"]) == ref_ids,
+                  f"{sorted(set(pq_df['id']) ^ ref_ids)}")
+            check("streaming parquet: same values as streaming CSV",
+                  pq_df.set_index("id").sort_index().fillna("").equals(
+                      df_st.set_index("id").sort_index()))
+
+        # --- --workers: several files in parallel == one by one
+        dumps = os.path.join(tmp, "dumps")
+        os.makedirs(dumps)
+        half = len(LINES) // 2
+        for name, part in [("RC_a.zst", LINES[:half]), ("RC_b.zst", LINES[half:])]:
+            with open(os.path.join(dumps, name), "wb") as f:
+                f.write(zstandard.ZstdCompressor().compress("\n".join(part).encode()))
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        outputs = {}
+        for w in (1, 2):
+            out_dir = os.path.join(tmp, f"workers{w}")
+            r = subprocess.run(
+                [sys.executable, os.path.join(repo, "reddit_zst_filter_zstandard.py"), dumps,
+                 "--value", ",".join(VALUES), "--fields", ",".join(fields),
+                 "--workers", str(w), "--output_dir", out_dir,
+                 "--config", os.path.join(tmp, "config.json")],
+                cwd=tmp, capture_output=True, text=True)
+            ok = r.returncode == 0
+            check(f"--workers {w} exits cleanly", ok, r.stderr[-500:])
+            outputs[w] = {n: pd.read_csv(os.path.join(out_dir, n), dtype=str, keep_default_na=False)
+                          for n in sorted(os.listdir(out_dir))} if ok else {}
+            if w == 2 and ok:
+                check("--workers 2: per-file progress logged from workers",
+                      "RC_a.zst" in r.stderr and "RC_b.zst" in r.stderr)
+        same = outputs.get(1) and outputs.get(2) and outputs[1].keys() == outputs[2].keys() and all(
+            outputs[1][n].equals(outputs[2][n]) for n in outputs[1])
+        check("--workers 2 output == --workers 1 output", bool(same))
+        all_ids = set().union(*[set(df["id"]) for df in outputs.get(2, {}).values()]) if outputs.get(2) else set()
+        check("--workers 2: union of files == reference ids", all_ids == ref_ids, f"{sorted(all_ids ^ ref_ids)}")
 
     print(f"\n{'OK' if failures == 0 else f'{failures} FAILED'} ({len(LINES)} synthetic lines, "
           f"{len(ref_ids)} expected matches)")
