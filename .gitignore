@@ -1,4 +1,5 @@
 input
 output
 logs
-venv__pycache__/
+venv
+__pycache__/
