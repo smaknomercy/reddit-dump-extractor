@@ -159,6 +159,7 @@ python reddit_zst_filter_zstandard.py <input_folder> [options]
 | `--fields` | Keep only these fields: comma list or preset from `config.json` (`submissions`, `comments`). With CSV, output is written in batches | all fields |
 | `--batch_size` | Records per write when `--fields` is set | `100000` |
 | `--no_prefilter` | Parse JSON of every line (original behaviour) | `false` |
+| `--workers` | Process this many `.zst` files in parallel, one process per file | `1` |
 
 ### Faster filtering and flat memory
 
@@ -172,9 +173,18 @@ The prefilter is switched off automatically in `--regex` mode and for values
 that are not plain ASCII names. Note: malformed lines are then counted only
 among candidates; use `--no_prefilter` to count them in the whole file.
 
-**Streaming output.** `--fields` keeps only the listed columns and, for CSV,
-appends to the output every `--batch_size` records instead of holding all
-matches in memory. Useful for comment dumps from large subreddits.
+**Streaming output.** `--fields` keeps only the listed columns and appends to
+the output every `--batch_size` records instead of holding all matches in
+memory. Useful for comment dumps from large subreddits. Works for CSV and
+Parquet; in streaming Parquet every column is stored as a string (missing
+values as nulls), because pandas infers types per batch and Parquet needs one
+schema per file. The values are the same text as in the CSV output; cast types
+after loading if needed.
+
+**Parallel files.** `--workers N` processes N `.zst` files at once (e.g. several
+months), one process per file, logs from all workers go to the same console and
+log file. Each worker holds its own buffers, so use `--fields` when running
+several workers on comment dumps.
 
 ```bash
 python reddit_zst_filter_zstandard.py /path/to/dumps \
@@ -191,6 +201,18 @@ Linux VM, 4 cores, same machine for both runs):
 | original | 32.8 s | 62k | 1.68 GB |
 | prefilter, all fields | 9.1 s | 233k | 0.60 GB |
 | prefilter + `--fields comments` | 9.3 s | 228k | 0.60 GB |
+
+Parallel files (4 files × 2,000,000 lines, `--fields comments`, same 4-core VM):
+
+| | wall time | lines/s |
+|---|---|---|
+| `--workers 1` | 39.8 s | 204k |
+| `--workers 4` | 19.7 s | 423k |
+
+On a full month (MacBook, `RS_2026-07`, 45.7M lines): original 18.7 min,
+new version 7.2 min, peak RSS 1.14 GB; output byte-identical to the original.
+Comments `RC_2026-07` + `RC_2026-08` (739M lines, two runs in parallel,
+`--fields`, 82 columns): 28 min, 220–238k lines/s each, RAM under 1 GB per run.
 
 Outputs of the original and the prefiltered run are cell-by-cell identical.
 Equivalence on edge cases: `python tests/test_equivalence.py`.
